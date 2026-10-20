@@ -1,3 +1,0 @@
-# Optional local transcription and noise reduction dependencies
-faster-whisper>=1.0.3
-noisereduce>=3.0.2
