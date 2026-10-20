@@ -1,0 +1,5 @@
+# Optional dependencies for additional local ASR model comparisons.
+# These models download large weights on first use; CPU inference may be slow.
+qwen-asr==0.0.6
+transformers>=4.57.6
+torch>=2.4.0

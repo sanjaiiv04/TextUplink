@@ -5,10 +5,11 @@ import streamlit as st
 import librosa
 import matplotlib.pyplot as plt
 import importlib.util
+import time
 
 st.set_page_config(page_title="Local Audio Triage — Phase 1", layout="wide")
 st.title("Local Audio Triage — Phase 1")
-st.caption("Local acoustic inspection prototype. Features describe the signal; they do not detect stress, emotion, or intent.")
+st.caption("Local acoustic inspection prototype. This is phase 1 of understanding how to process raw speech under noisy environments.")
 
 uploaded = st.file_uploader("Upload an audio file", type=["wav", "mp3", "m4a", "ogg", "flac"])
 if uploaded is None:
@@ -87,15 +88,15 @@ axes[1].legend(loc="best")
 axes[1].grid(alpha=.25)
 fig.tight_layout(); st.pyplot(fig); plt.close(fig)
 
-st.subheader("2. Pitch estimate (YIN; exploratory)")
+st.subheader("2. Pitch estimate")
 fig, ax = plt.subplots(figsize=(12, 3.5))
 ax.plot(times, d["f0"], ".", markersize=2, alpha=.65)
 ax.set_ylim(60, min(520, sr / 2))
 ax.set_xlabel("Time (s)"); ax.set_ylabel("Estimated F0 (Hz)")
-ax.set_title("Low-energy frames hidden; remaining estimates are not confidence-calibrated")
+ax.set_title("Note: Low-energy frames hidden and the remaining estimates are not confidence calibrated. Needs iteration.")
 ax.grid(alpha=.25); fig.tight_layout(); st.pyplot(fig); plt.close(fig)
 
-st.subheader("3. Spectral flatness — interpretable view")
+st.subheader("3. Spectral flatness")
 st.write("Spectral flatness compares the geometric and arithmetic means of the magnitude spectrum. Values nearer 0 indicate a more peaked/tonal spectrum; values nearer 1 indicate a flatter, more noise-like spectrum. It is a descriptor, not a standalone noise detector.")
 flat = d["flatness"]
 # Avoid using near-silent frames to set the zoom scale or the review threshold.
@@ -154,104 +155,93 @@ ax.plot(times, d["zcr"], linewidth=.8)
 ax.set_xlabel("Time (s)"); ax.set_ylabel("Zero-crossing rate")
 ax.grid(alpha=.25); fig.tight_layout(); st.pyplot(fig); plt.close(fig)
 
-st.subheader("5. Candidate low-energy intervals")
-quiet = d["quiet"]
-# Merge adjacent frames and keep intervals at least 0.2 seconds.
-intervals = []
-idx = np.flatnonzero(quiet)
-if idx.size:
-    starts = [idx[0]]; ends = []
-    for a, b in zip(idx[:-1], idx[1:]):
-        if b > a + 1:
-            ends.append(a); starts.append(b)
-    ends.append(idx[-1])
-    for a, b in zip(starts, ends):
-        start_t = float(times[a]); end_t = float(times[b] + d["hop"] / sr)
-        if end_t - start_t >= 0.2:
-            intervals.append({"start_s": round(start_t, 2), "end_s": round(end_t, 2), "duration_s": round(end_t-start_t, 2)})
-if intervals:
-    interval_df = pd.DataFrame(intervals)
-    st.dataframe(interval_df, use_container_width=True, hide_index=True)
-else:
-    interval_df = pd.DataFrame(columns=["start_s", "end_s", "duration_s"])
-    st.info("No intervals met the current threshold and minimum-duration rule.")
-st.caption("These are relative low-energy candidates only, not confirmed silence, speech gaps, or important events.")
+st.subheader("5. Open-source transcription model comparison")
+st.write("Compare Whisper with two different open-source ASR model families on the same audio. All models receive the same selected source (original or noise-reduced), making this a small controlled comparison. First-time runs download model weights and may take several minutes.")
+st.markdown("- **Whisper** — encoder-decoder ASR; already available above.\n- **Qwen3-ASR 0.6B** — multilingual ASR model.\n- **NVIDIA Parakeet CTC 1.1B** — Conformer/CTC-based English ASR model.")
+st.caption("The comparison reports transcripts and runtime, not an automatic accuracy score. To measure accuracy, compare each transcript against a verified reference transcript (e.g., word error rate).")
+comparison_source_choice = st.radio("Audio input for comparison", ["Original audio", "Noise-reduced audio"], horizontal=True,
+                                    help="Noise-reduced audio is available only if noise reduction was applied in the transcription section above during this page run.")
+comparison_models = st.multiselect("Models to run", ["Whisper base", "Qwen3-ASR 0.6B", "NVIDIA Parakeet CTC 1.1B"],
+                                   default=["Whisper base", "Qwen3-ASR 0.6B", "NVIDIA Parakeet CTC 1.1B"])
+comparison_language = st.selectbox("Language for comparison models", ["Auto-detect", "English"], index=1)
+comparison_clicked = st.button("Run model comparison", type="primary")
 
-st.subheader("6. Optional local transcription with noise reduction")
-st.write("The app can optionally suppress background noise before sending audio to Whisper. The original remains untouched. Noise reduction can also remove quiet consonants or create artifacts, so compare the original and enhanced audio and treat the transcript as a hypothesis.")
-if importlib.util.find_spec("faster_whisper") is None:
-    st.info("Optional dependencies not installed. Run `pip install -r requirements-transcription.txt` in the same environment, then restart Streamlit.")
-else:
-    tcol1, tcol2 = st.columns([1, 2])
-    with tcol1:
-        whisper_size = st.selectbox("Local Whisper model", ["tiny", "base", "small", "medium"], index=1,
-                                    help="Start with base for a CPU-friendly demo. Larger models are slower and use more memory.")
-        language_choice = st.selectbox("Transcription language", ["Auto-detect", "English"], index=0)
-        reduce_noise = st.checkbox("Reduce background noise before transcription", value=True)
-        noise_strength = st.slider("Noise reduction strength", min_value=0.2, max_value=1.0, value=0.65, step=0.05,
-                                   help="Higher values suppress more noise but may remove quiet speech details. Start around 0.5–0.7.")
-        transcribe_clicked = st.button("Transcribe locally", type="primary")
-    with tcol2:
-        st.caption("Noise reduction uses a spectral-gating method. It does not intentionally shift pitch or translate speech, but artifacts are possible. Compare with the original, especially for radio speech and quiet consonants.")
-    if reduce_noise and importlib.util.find_spec("noisereduce") is None:
-        st.warning("Noise reduction package is missing. Install the updated optional requirements with `pip install -r requirements-transcription.txt`, then restart Streamlit.")
-    if transcribe_clicked:
+if comparison_clicked:
+    comparison_audio = y.astype(np.float32).copy()
+    if comparison_source_choice == "Noise-reduced audio":
+        if importlib.util.find_spec("noisereduce") is None:
+            st.error("Noise-reduced comparison requires `noisereduce`. Install requirements-transcription.txt and restart Streamlit.")
+            st.stop()
+        import noisereduce as nr
+        with st.spinner("Preparing noise-reduced audio for all comparison models…"):
+            comparison_audio = nr.reduce_noise(y=comparison_audio, sr=sr, stationary=False, prop_decrease=0.65)
+    comparison_audio = librosa.resample(comparison_audio, orig_sr=sr, target_sr=16000) if sr != 16000 else comparison_audio
+    comparison_results = []
+    for selected_model in comparison_models:
+        started = time.perf_counter()
         try:
-            from faster_whisper import WhisperModel
-            whisper_source = y.astype(np.float32).copy()
-            noise_reduction_applied = False
-            if reduce_noise:
-                if importlib.util.find_spec("noisereduce") is None:
-                    st.error("Cannot apply noise reduction because `noisereduce` is not installed. Install requirements-transcription.txt and retry.")
-                    st.stop()
-                import noisereduce as nr
-                with st.spinner("Reducing background noise while preserving the original sample rate…"):
-                    whisper_source = nr.reduce_noise(y=whisper_source, sr=sr, stationary=False,
-                                                     prop_decrease=float(noise_strength))
-                noise_reduction_applied = True
-                # Preview/download enhanced audio at its original sample rate.
-                enhanced_buffer = io.BytesIO()
-                import soundfile as sf
-                sf.write(enhanced_buffer, whisper_source, sr, format="WAV")
-                enhanced_bytes = enhanced_buffer.getvalue()
-                st.markdown("**Enhanced audio preview**")
-                st.audio(enhanced_bytes, format="audio/wav")
-                st.download_button("Download noise-reduced WAV", enhanced_bytes,
-                                   file_name="noise_reduced_audio.wav", mime="audio/wav")
-            with st.spinner(f"Loading Whisper {whisper_size} and transcribing locally… first use may take a while"):
-                model = WhisperModel(whisper_size, device="cpu", compute_type="int8")
-                # Resampling changes sample rate for model input, not the underlying pitch.
-                whisper_audio = librosa.resample(whisper_source, orig_sr=sr, target_sr=16000) if sr != 16000 else whisper_source
+            if selected_model == "Whisper base":
+                if importlib.util.find_spec("faster_whisper") is None:
+                    raise ImportError("Missing optional dependency `faster-whisper`. Install requirements-transcription.txt and restart Streamlit.")
+                from faster_whisper import WhisperModel
+                with st.spinner("Loading Whisper base (first run downloads model weights)…"):
+                    whisper_model_compare = WhisperModel("base", device="cpu", compute_type="int8")
                 kwargs = {"beam_size": 5, "vad_filter": False}
-                if language_choice == "English":
+                if comparison_language == "English":
                     kwargs["language"] = "en"
-                segments, info = model.transcribe(whisper_audio, **kwargs)
-                rows = [{"start_s": round(seg.start, 2), "end_s": round(seg.end, 2), "text": seg.text.strip()} for seg in segments]
-                # Materialize lazy generator inside spinner.
-                rows = list(rows)
-            mode_label = "noise-reduced audio" if noise_reduction_applied else "original audio"
-            st.success(f"Transcription of {mode_label} complete · detected language: {info.language} (probability {info.language_probability:.2f})")
-            if rows:
-                transcript_df = pd.DataFrame(rows)
-                st.dataframe(transcript_df, use_container_width=True, hide_index=True)
-                st.download_button("Download timestamped transcript (CSV)", transcript_df.to_csv(index=False).encode("utf-8"),
-                                   file_name="local_transcript.csv", mime="text/csv")
-                st.text_area("Transcript", "\n".join(f"[{r['start_s']:.2f}–{r['end_s']:.2f}] {r['text']}" for r in rows), height=220)
+                with st.spinner("Transcribing with Whisper base…"):
+                    segments, info = whisper_model_compare.transcribe(comparison_audio, **kwargs)
+                    segment_rows = list(segments)
+                transcript_text = " ".join(seg.text.strip() for seg in segment_rows).strip()
+                detected_language = f"{info.language} (p={info.language_probability:.2f})"
+            elif selected_model == "Qwen3-ASR 0.6B":
+                if importlib.util.find_spec("qwen_asr") is None:
+                    raise ImportError("Missing optional dependency `qwen-asr`. Install requirements-comparison.txt and restart Streamlit.")
+                import torch
+                from qwen_asr import Qwen3ASRModel
+                with st.spinner("Loading Qwen3-ASR 0.6B (first run downloads model weights)…"):
+                    qwen_model = Qwen3ASRModel.from_pretrained(
+                        "Qwen/Qwen3-ASR-0.6B",
+                        dtype=torch.float32,
+                        device_map="cpu",
+                        max_new_tokens=256,
+                    )
+                language_arg = "English" if comparison_language == "English" else None
+                with st.spinner("Transcribing with Qwen3-ASR 0.6B…"):
+                    qwen_results = qwen_model.transcribe(audio=(comparison_audio, 16000), language=language_arg)
+                transcript_text = str(qwen_results[0].text).strip() if qwen_results else ""
+                detected_language = getattr(qwen_results[0], "language", "unknown") if qwen_results else "unknown"
             else:
-                st.warning("No speech segments were returned. Try a lower noise-reduction strength, enable/disable noise reduction to compare, or inspect the audio quality.")
+                if importlib.util.find_spec("transformers") is None or importlib.util.find_spec("torch") is None:
+                    raise ImportError("Missing optional dependencies `transformers` and/or `torch`. Install requirements-comparison.txt and restart Streamlit.")
+                from transformers import pipeline
+                # Parakeet expects 16 kHz audio. Keep inference on CPU for portability.
+                with st.spinner("Loading NVIDIA Parakeet CTC 1.1B (first run downloads model weights)…"):
+                    asr_pipe = pipeline("automatic-speech-recognition", model="nvidia/parakeet-ctc-1.1b", device=-1)
+                with st.spinner("Transcribing with NVIDIA Parakeet CTC 1.1B…"):
+                    parakeet_result = asr_pipe({"raw": comparison_audio, "sampling_rate": 16000})
+                transcript_text = str(parakeet_result.get("text", "")).strip()
+                detected_language = "English model (language not auto-detected)"
+            elapsed = time.perf_counter() - started
+            comparison_results.append({"Model": selected_model, "Status": "Completed", "Runtime (s)": round(elapsed, 2),
+                                       "Language": str(detected_language), "Transcript": transcript_text or "[No text returned]"})
         except Exception as e:
-            st.error(f"Local transcription failed: {e}")
-            st.caption("If this is the first run, check internet access for model download, available disk space, and the terminal traceback.")
+            elapsed = time.perf_counter() - started
+            comparison_results.append({"Model": selected_model, "Status": f"Failed: {type(e).__name__}", "Runtime (s)": round(elapsed, 2),
+                                       "Language": "—", "Transcript": str(e)})
+    if comparison_results:
+        result_df = pd.DataFrame(comparison_results)
+        st.dataframe(result_df, use_container_width=True, hide_index=True)
+        st.download_button("Download model comparison (CSV)", result_df.to_csv(index=False).encode("utf-8"),
+                           file_name="asr_model_comparison.csv", mime="text/csv")
+    else:
+        st.info("Select at least one comparison model to run.")
 
 feature_df = pd.DataFrame({"time_s": times, "rms_db_relative": d["rms_db"], "pitch_hz": d["f0"],
                            "pitch_frame_retained": d["pitch_valid"], "spectral_flatness": flat,
                            "spectral_flatness_smoothed": d["flat_smooth"], "active_energy_frame": active,
                            "high_spectral_flatness_flag": high_flat,
                            "zero_crossing_rate": d["zcr"]})
-st.download_button("Download frame-level features (CSV)", feature_df.to_csv(index=False).encode("utf-8"),
-                   file_name="audio_triage_features.csv", mime="text/csv")
-st.download_button("Download candidate intervals (CSV)", interval_df.to_csv(index=False).encode("utf-8"),
-                   file_name="candidate_review_intervals.csv", mime="text/csv")
 with st.expander("Analysis settings and caveats"):
     st.write(f"FFT window: {d['n_fft']} samples ({1000*d['n_fft']/sr:.1f} ms); hop: {1000*d['hop']/sr:.1f} ms.")
     st.write(f"Active-frame threshold: {d['active_threshold']:.1f} dB relative RMS level. Quiet threshold: {d['quiet_threshold_db']:.1f} dB relative RMS level. High-flatness cue: active-frame 90th percentile ({flat_cutoff:.4f}).")
