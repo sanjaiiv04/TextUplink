@@ -15,7 +15,7 @@ def forbid_network(*args,**kwargs):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('backend',choices=['deepfilter','mossformer'])
+    parser.add_argument('backend',choices=['reuse','deepfilter','mossformer'])
     parser.add_argument('input')
     parser.add_argument('output')
     parser.add_argument('model_dir')
@@ -31,6 +31,35 @@ def main():
     audio=np.load(args.input,allow_pickle=False)
     if audio.ndim!=1 or not 2400<=len(audio)<=24000*60 or not np.isfinite(audio).all():
         raise ValueError('Worker expects finite 24 kHz mono audio from 0.1 to 60 seconds')
+    if args.backend=='reuse':
+        import hashlib
+        import json
+        import subprocess
+        import tempfile
+        import soundfile as sf
+        manifest=json.loads((root/'manifest.json').read_text())
+        required=['model_mlx.safetensors','runtime/speechlens-cli','runtime/mlx.metallib','runtime/ffmpeg','runtime/ffprobe']
+        for name in required:
+            path=root/name
+            if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest()!=manifest['sha256'].get(name):
+                raise ValueError(f'RE-USE artifact missing or changed: {name}; provision it again')
+        with tempfile.TemporaryDirectory(prefix='textuplink-reuse-') as work:
+            incoming=Path(work)/'input.wav'
+            outgoing=Path(work)/'output.wav'
+            sf.write(incoming,audio,24000,subtype='FLOAT')
+            # Deny network to the native process too; Python socket guards alone
+            # cannot constrain a subprocess. No automatic downloads or telemetry.
+            command=['/usr/bin/sandbox-exec','-p','(version 1)(allow default)(deny network*)',
+                     str(root/'runtime'/'speechlens-cli'),'--weights',str(root/'model_mlx.safetensors'),
+                     '--input',str(incoming),'--output',str(outgoing),'--chunk-seconds','5','--strict']
+            result=subprocess.run(command,capture_output=True,text=True,timeout=280)
+            if result.returncode or not outgoing.is_file():
+                raise RuntimeError(f'RE-USE native inference failed: {result.stderr[-2000:] or result.stdout[-2000:]}')
+            enhanced,sample_rate=sf.read(outgoing,dtype='float32')
+            if sample_rate!=24000 or enhanced.shape!=audio.shape or not np.isfinite(enhanced).all():
+                raise ValueError('RE-USE returned invalid audio, sample rate or duration')
+            np.save(args.output,enhanced,allow_pickle=False)
+        return
     fullband=librosa.resample(audio,orig_sr=24000,target_sr=48000).astype(np.float32)
     import mlx.core as mx
     mx.random.seed(0)

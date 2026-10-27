@@ -1,7 +1,8 @@
 import unittest
 from types import SimpleNamespace
 import numpy as np
-from textuplink.transcript import annotate_context, colored_html, review_annotations, transcribe_words
+from textuplink.transcript import annotate_context, review_annotations, transcribe_words
+from textuplink.captions import caption_player
 
 
 def word(text,start,end):
@@ -42,8 +43,8 @@ class TranscriptTests(unittest.TestCase):
     def test_colored_transcript_escapes_text_and_attributes(self):
         row=word('<script>alert(1)</script>',0,1)
         row['annotation_source']='" onmouseover="evil'
-        output=colored_html([row])
-        self.assertNotIn('<script>',output)
+        output=caption_player([row],np.zeros(24000))
+        self.assertNotIn('<script>alert(1)</script>',output)
         self.assertIn('&lt;script&gt;',output)
         self.assertIn('&quot;',output)
         self.assertNotIn('title="Unlabelled · " onmouseover',output)

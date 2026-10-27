@@ -5,44 +5,26 @@ from textuplink.speech_processing import enhance_speech
 
 
 class SpeechProcessingTests(unittest.TestCase):
-    def test_gain_raises_voice_without_changing_relative_delivery(self):
-        speech=np.array([0.,.01,-.02,.04,-.08],dtype=np.float32)
-        result,stats=enhance_speech(speech,reduce_noise=False,boost_db=12.)
-        np.testing.assert_allclose(result,speech*10**(12/20),rtol=1e-6)
-        self.assertAlmostEqual(stats['output_rms_dbfs']-stats['cleaned_rms_dbfs'],12.,places=5)
-        self.assertFalse(stats['peak_limited'])
-        self.assertEqual(len(result),len(speech))
+    def test_disabled_isolation_preserves_the_recording_exactly(self):
+        speech=np.array([0.,.01,-.02,1.2,-1.1],dtype=np.float32)
+        result,stats=enhance_speech(speech,reduce_noise=False)
+        np.testing.assert_array_equal(result,speech)
+        self.assertFalse(stats['noise_reduction'])
 
-    def test_headroom_limits_gain_uniformly_instead_of_clipping(self):
-        speech=np.array([.01,.2,-.8,.03],dtype=np.float32)
-        result,stats=enhance_speech(speech,reduce_noise=False,boost_db=24.)
-        ceiling=10**(-1/20)
-        self.assertLessEqual(float(np.max(np.abs(result))),ceiling+1e-7)
-        np.testing.assert_allclose(result/speech,result[0]/speech[0],rtol=1e-6)
-        self.assertTrue(stats['peak_limited'])
-        self.assertLess(stats['applied_gain_db'],24.)
+    def test_spectral_option_reduces_noise(self):
+        y=np.random.default_rng(11).normal(0,.03,72000).astype(np.float32)
+        result,_=enhance_speech(y,backend='spectral',strength=.7)
+        self.assertEqual(result.shape,y.shape)
+        self.assertLess(np.sqrt(np.mean(result**2)),np.sqrt(np.mean(y**2)))
 
-    def test_silence_does_not_get_extreme_gain(self):
-        result,stats=enhance_speech(np.zeros(24000),reduce_noise=False,boost_db=24.)
-        self.assertTrue(np.isfinite(result).all())
-        self.assertEqual(stats['applied_gain_db'],0)
-        self.assertTrue(np.all(result==0))
 
-    def test_noise_suppression_precedes_measurable_gain(self):
-        rng=np.random.default_rng(11)
-        y=(.03*rng.normal(size=72000)).astype(np.float32)
-        y[24000:48000]+=(.08*np.sin(2*np.pi*220*np.arange(24000)/24000)).astype(np.float32)
-        cleaned,_=enhance_speech(y,strength=.7,boost_db=0.,steady_noise=True)
-        boosted,stats=enhance_speech(y,strength=.7,boost_db=9.,steady_noise=True)
-        self.assertLess(np.sqrt(np.mean(cleaned[:12000]**2)),np.sqrt(np.mean(y[:12000]**2)))
-        np.testing.assert_allclose(boosted,cleaned*10**(stats['applied_gain_db']/20),rtol=1e-5,atol=1e-7)
-        self.assertEqual(len(boosted),len(y))
-        self.assertGreater(stats['output_rms_dbfs'],stats['cleaned_rms_dbfs'])
+
+
 
     def test_neural_wet_dry_mix_and_failure_never_silently_fall_back(self):
         y=np.full(2400,.1,dtype=np.float32)
         with patch('textuplink.speech_processing.neural_enhance',return_value=y*.2):
-            mixed,stats=enhance_speech(y,backend='deepfilter',strength=.5,boost_db=0.)
+            mixed,stats=enhance_speech(y,backend='deepfilter',strength=.5)
             np.testing.assert_allclose(mixed,y*.6)
             self.assertEqual(stats['enhancement_backend'],'deepfilter')
         with patch('textuplink.speech_processing.neural_enhance',side_effect=RuntimeError('missing weights')):
@@ -54,6 +36,25 @@ class SpeechProcessingTests(unittest.TestCase):
     def test_invalid_input_rejected(self):
         for audio in [np.array([]),np.array([np.nan]),np.zeros((2,100))]:
             with self.assertRaises(ValueError):enhance_speech(audio)
+
+    def test_reuse_rejects_changed_artifacts_before_native_execution(self):
+        import hashlib
+        import json
+        from pathlib import Path
+        import subprocess
+        import sys
+        import tempfile
+        with tempfile.TemporaryDirectory() as work:
+            root=Path(work)
+            np.save(root/'input.npy',np.zeros(2400,dtype=np.float32),allow_pickle=False)
+            (root/'model_mlx.safetensors').write_bytes(b'changed weights')
+            (root/'manifest.json').write_text(json.dumps({'sha256':{
+                'model_mlx.safetensors':hashlib.sha256(b'expected weights').hexdigest()}}))
+            result=subprocess.run([sys.executable,'-B','-m','textuplink.enhancement_worker',
+                'reuse',str(root/'input.npy'),str(root/'output.npy'),str(root)],capture_output=True,text=True)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('RE-USE artifact missing or changed',result.stderr)
+            self.assertFalse((root/'output.npy').exists())
 
 
 if __name__=='__main__':unittest.main()

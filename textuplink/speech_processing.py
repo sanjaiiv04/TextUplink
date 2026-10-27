@@ -1,4 +1,4 @@
-"""Local noise suppression followed by transparent, peak-safe speech-level gain."""
+"""Local voice isolation for expressive captions; no gain processing."""
 from pathlib import Path
 import subprocess
 import os
@@ -7,8 +7,8 @@ import tempfile
 import numpy as np
 
 
-ENHANCERS={'spectral':'Spectral gating (baseline)', 'deepfilter':'DeepFilterNet3', 'mossformer':'MossFormer2 SE'}
-MODEL_PATHS={'deepfilter':'deepfilternet3','mossformer':'mossformer2'}
+ENHANCERS={'reuse':'NVIDIA NemotronLabs RE-USE', 'spectral':'Spectral gating (baseline)', 'deepfilter':'DeepFilterNet3', 'mossformer':'MossFormer2 SE'}
+MODEL_PATHS={'reuse':'reuse','deepfilter':'deepfilternet3','mossformer':'mossformer2'}
 
 
 def neural_enhance(audio,backend):
@@ -30,25 +30,20 @@ def neural_enhance(audio,backend):
         return np.load(outgoing,allow_pickle=False)
 
 
-def enhance_speech(audio, reduce_noise=True, strength=.5, boost_db=9., steady_noise=False, ceiling_dbfs=-1., backend='spectral'):
-    """Use one gain for the recording to preserve relative emphasis and timing.
-
-    The selected backend suppresses noise; it does not guarantee isolation. Gain
-    also raises any remaining noise. Avoid clipping by reducing the applied gain
-    for the entire recording rather than compressing individual peaks.
-    """
+def enhance_speech(audio, reduce_noise=True, strength=1., backend='reuse'):
+    """Suppress noise without changing recording gain or relative delivery."""
     if backend not in ENHANCERS:
         raise ValueError('Unknown enhancement backend')
     y=np.asarray(audio,dtype=np.float32)
     if y.ndim!=1 or not y.size or not np.isfinite(y).all():
         raise ValueError('Use non-empty finite mono audio')
-    if not np.isfinite([strength,boost_db,ceiling_dbfs]).all() or not 0<=strength<=1 or not 0<=boost_db<=24 or not -12<=ceiling_dbfs<=0:
-        raise ValueError('Invalid noise suppression or gain settings')
+    if not np.isfinite(strength) or not 0<=strength<=1:
+        raise ValueError('Invalid enhancement mix')
     cleaned=y.copy()
     if reduce_noise and strength>0:
         if backend=='spectral':
             import noisereduce as nr
-            cleaned=np.asarray(nr.reduce_noise(y=cleaned,sr=24000,stationary=steady_noise,
+            cleaned=np.asarray(nr.reduce_noise(y=cleaned,sr=24000,stationary=False,
                                               prop_decrease=strength),dtype=np.float32)
         else:
             enhanced=neural_enhance(cleaned,backend)
@@ -57,16 +52,9 @@ def enhance_speech(audio, reduce_noise=True, strength=.5, boost_db=9., steady_no
             cleaned=((1-strength)*y+strength*enhanced).astype(np.float32)
     if not np.isfinite(cleaned).all():
         raise ValueError('Noise reduction returned invalid audio')
-    ceiling=10**(ceiling_dbfs/20)
-    peak=float(np.max(np.abs(cleaned)))
-    requested=10**(boost_db/20)
-    gain=min(requested,ceiling/peak) if peak>1e-8 else 1.
-    processed=(cleaned*gain).astype(np.float32)
-    stats=dict(enhancement_backend=backend,enhancement_runtime='spectral' if backend=='spectral' else 'MLX-Audio 0.6.2 inference subset / MLX 0.32.4 (Apple Silicon)',noise_reduction=bool(reduce_noise),noise_reduction_strength=float(strength) if reduce_noise else None,
-               noise_mode='steady' if steady_noise else 'changing',requested_boost_db=float(boost_db),
-               applied_gain_db=float(20*np.log10(gain)),peak_ceiling_dbfs=float(ceiling_dbfs),
-               peak_limited=bool(gain<requested and peak>1e-8),
-               input_rms_dbfs=float(20*np.log10(max(float(np.sqrt(np.mean(y.astype(np.float64)**2))),1e-12))),
-               cleaned_rms_dbfs=float(20*np.log10(max(float(np.sqrt(np.mean(cleaned.astype(np.float64)**2))),1e-12))),
-               output_rms_dbfs=float(20*np.log10(max(float(np.sqrt(np.mean(processed.astype(np.float64)**2))),1e-12))))
-    return processed,stats
+    runtime=('SpeechLens CLI v1.0 / MLX Metal (strict), NemotronLabs RE-USE 31f82f2' if backend=='reuse'
+             else 'spectral' if backend=='spectral' else 'MLX-Audio 0.6.2 inference subset / MLX 0.32.4 (Apple Silicon)')
+    stats=dict(enhancement_backend=backend,enhancement_runtime=runtime,
+               noise_reduction=bool(reduce_noise),
+               enhanced_mix=float(strength) if reduce_noise else None)
+    return cleaned,stats

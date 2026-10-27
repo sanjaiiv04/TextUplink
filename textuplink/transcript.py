@@ -1,5 +1,4 @@
 """Local transcript timing and reviewable phrase-context emotion annotations."""
-import html
 from pathlib import Path
 import numpy as np
 
@@ -98,13 +97,3 @@ def review_annotations(edited,baseline):
             entry['annotation_source']='Human override'
         result.append(entry)
     return result
-
-
-def colored_html(rows):
-    parts=[]
-    for row in rows:
-        label=row.get('emotion','Unlabelled')
-        color=COLORS.get(label,COLORS['Unlabelled'])
-        title=f"{label} · {row.get('annotation_source','None')} · {row['start_s']:.2f}–{row['end_s']:.2f}s"
-        parts.append(f'<span style="color:{color};border-bottom:2px solid {color};padding:2px 1px" title="{html.escape(title,quote=True)}">{html.escape(str(row["word"]))}</span>')
-    return '<div style="font-size:1.15rem;line-height:2.2">'+' '.join(parts)+'</div>'
