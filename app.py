@@ -1,248 +1,361 @@
-import io
+"""TextUplink: local low-bandwidth speech reconstruction experiment."""
+import hashlib
+import json
+from pathlib import Path
+import time
+
 import numpy as np
 import pandas as pd
 import streamlit as st
-import librosa
-import matplotlib.pyplot as plt
-import importlib.util
-import time
+from textuplink.codec_packet import unpack_codes
+from textuplink.neural_codec import LocalCodec, MODEL_DIRS, read_audio, wav_bytes, add_noise, compare_audio
+from textuplink.speech_processing import ENHANCERS
 
-st.set_page_config(page_title="Local Audio Triage — Phase 1", layout="wide")
-st.title("Local Audio Triage — Phase 1")
-st.caption("Local acoustic inspection prototype. This is phase 1 of understanding how to process raw speech under noisy environments.")
+ROOT = Path(__file__).resolve().parent
+st.set_page_config(page_title='TextUplink · Speech Codec Lab', layout='wide')
+st.title('TextUplink · Speech Codec Lab')
+st.caption('Speech → compact acoustic tokens → reconstructed voice. All model inference stays on this device.')
+st.write('Captured voice → reduce noise → encode acoustic detail → small packet → decode voice. A transcript with reviewable emotion colors runs alongside this audio path.')
 
-uploaded = st.file_uploader("Upload an audio file", type=["wav", "mp3", "m4a", "ogg", "flac"])
-if uploaded is None:
-    st.info("Upload a recording to inspect its waveform, energy, pitch, and spectral features.")
-    st.stop()
+
+@st.cache_resource(show_spinner=False, max_entries=3)
+def get_codec(family):
+    return LocalCodec(family, ROOT/MODEL_DIRS[family])
+
 
 @st.cache_data(show_spinner=False)
-def analyze_audio(file_bytes: bytes, filename: str):
-    y, sr = librosa.load(io.BytesIO(file_bytes), sr=None, mono=True)
-    if y.size == 0:
-        raise ValueError("The uploaded audio appears to be empty.")
-    duration = len(y) / sr
-    # Short-time features. Keep FFT window suitable for narrow-band 8 kHz radio recordings.
-    n_fft = 1024 if sr >= 16000 else 512
-    hop = max(1, int(sr * 0.02))  # 20 ms hop
-    if len(y) < n_fft:
-        y = np.pad(y, (0, n_fft - len(y)))
-    rms = librosa.feature.rms(y=y, frame_length=n_fft, hop_length=hop, center=True)[0]
-    # Spectral flatness should be computed from the MAGNITUDE spectrogram.
-    # Passing power spectrum with power=1 compresses the dynamic range and can
-    # make values look almost uniformly close to zero.
-    magnitude = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop, window="hann", center=True))
-    flatness = librosa.feature.spectral_flatness(S=np.maximum(magnitude, 1e-10), power=2.0)[0]
-    zcr = librosa.feature.zero_crossing_rate(y, frame_length=n_fft, hop_length=hop, center=True)[0]
-    times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop)
-    # YIN pitch estimates; treat only values within range as candidates, not guaranteed valid pitch.
-    try:
-        f0 = librosa.yin(y, fmin=65, fmax=min(500, sr / 2 - 1), sr=sr,
-                         frame_length=n_fft, hop_length=hop)
-        f0 = f0[:len(times)]
-    except Exception:
-        f0 = np.full(len(times), np.nan)
-    if len(f0) < len(times):
-        f0 = np.pad(f0, (0, len(times)-len(f0)), constant_values=np.nan)
-    # Exclude low-energy frames from pitch display to reduce meaningless estimates.
-    rms_db = 20 * np.log10(np.maximum(rms, 1e-8))
-    active_threshold = max(np.percentile(rms_db, 20), np.max(rms_db) - 45)
-    pitch_valid = np.isfinite(f0) & (f0 >= 65) & (f0 <= min(500, sr / 2 - 1)) & (rms_db > active_threshold)
-    f0_plot = np.where(pitch_valid, f0, np.nan)
-    # A smoothed flatness trace helps show local changes without hiding raw values.
-    flat_smooth = pd.Series(flatness).rolling(window=5, center=True, min_periods=1).median().to_numpy()
-    # Relative low-energy intervals; these are review candidates, not detected events.
-    quiet_threshold_db = float(np.max(rms_db) - 35)
-    quiet = rms_db < quiet_threshold_db
-    return {"y": y, "sr": sr, "duration": duration, "n_fft": n_fft, "hop": hop,
-            "times": times, "rms": rms, "rms_db": rms_db, "flatness": flatness,
-            "flat_smooth": flat_smooth, "zcr": zcr, "f0": f0_plot,
-            "pitch_valid": pitch_valid, "quiet": quiet, "quiet_threshold_db": quiet_threshold_db,
-            "active_threshold": active_threshold}
+def prepare_speech(audio,reduce,strength,boost_db,steady_noise,backend):
+    from textuplink.speech_processing import enhance_speech
+    return enhance_speech(audio,reduce_noise=reduce,strength=strength,boost_db=boost_db,steady_noise=steady_noise,backend=backend)
 
-try:
-    with st.spinner("Analyzing audio features…"):
-        d = analyze_audio(uploaded.getvalue(), uploaded.name)
-except Exception as e:
-    st.error(f"Could not analyze this audio: {e}")
-    st.stop()
 
-y, sr, times = d["y"], d["sr"], d["times"]
-c1, c2, c3 = st.columns(3)
-c1.metric("Duration", f"{d['duration']:.1f} s")
-c2.metric("Sample rate", f"{sr:,} Hz")
-c3.metric("Pitch frames retained", f"{100*np.mean(d['pitch_valid']):.1f}%")
-st.audio(uploaded.getvalue())
+@st.cache_resource(show_spinner=False)
+def get_transcriber():
+    from textuplink.transcript import load_transcriber
+    return load_transcriber(ROOT)
 
-st.subheader("1. Waveform and short-time energy")
-fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
-wave_t = np.arange(len(y)) / sr
-axes[0].plot(wave_t, y, linewidth=0.5)
-axes[0].set_ylabel("Amplitude")
-axes[0].grid(alpha=.25)
-axes[1].plot(times, d["rms_db"], linewidth=1)
-axes[1].axhline(d["quiet_threshold_db"], linestyle="--", label=f"Relative low-energy threshold ({d['quiet_threshold_db']:.1f} dB)")
-axes[1].set_ylabel("RMS level (dB, relative)")
-axes[1].set_xlabel("Time (s)")
-axes[1].legend(loc="best")
-axes[1].grid(alpha=.25)
-fig.tight_layout(); st.pyplot(fig); plt.close(fig)
 
-st.subheader("2. Pitch estimate")
-fig, ax = plt.subplots(figsize=(12, 3.5))
-ax.plot(times, d["f0"], ".", markersize=2, alpha=.65)
-ax.set_ylim(60, min(520, sr / 2))
-ax.set_xlabel("Time (s)"); ax.set_ylabel("Estimated F0 (Hz)")
-ax.set_title("Note: Low-energy frames hidden and the remaining estimates are not confidence calibrated. Needs iteration.")
-ax.grid(alpha=.25); fig.tight_layout(); st.pyplot(fig); plt.close(fig)
+@st.cache_resource(show_spinner=False)
+def get_emotion_model():
+    from textuplink.transcript import LocalEmotion
+    return LocalEmotion(ROOT/'models/emotion')
 
-st.subheader("3. Spectral flatness")
-st.write("Spectral flatness compares the geometric and arithmetic means of the magnitude spectrum. Values nearer 0 indicate a more peaked/tonal spectrum; values nearer 1 indicate a flatter, more noise-like spectrum. It is a descriptor, not a standalone noise detector.")
-flat = d["flatness"]
-# Avoid using near-silent frames to set the zoom scale or the review threshold.
-active = d["rms_db"] > d["active_threshold"]
-flat_active = flat[active & np.isfinite(flat)]
-if flat_active.size:
-    q10, q50, q90, q99 = np.percentile(flat_active, [10, 50, 90, 99])
-else:
-    q10 = q50 = q90 = q99 = np.nan
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Active-frame median", f"{q50:.4f}" if np.isfinite(q50) else "N/A")
-m2.metric("10th percentile", f"{q10:.4f}" if np.isfinite(q10) else "N/A")
-m3.metric("90th percentile", f"{q90:.4f}" if np.isfinite(q90) else "N/A")
-m4.metric("99th percentile", f"{q99:.4f}" if np.isfinite(q99) else "N/A")
-fig, axes = plt.subplots(3, 1, figsize=(12, 10), constrained_layout=True)
-axes[0].plot(times, flat, linewidth=.7, alpha=.65, label="All frames")
-axes[0].plot(times, d["flat_smooth"], linewidth=1.1, label="5-frame rolling median")
-axes[0].set_ylabel("Flatness (0–1)"); axes[0].set_ylim(0, 1)
-axes[0].set_title("Full scale — includes low-energy frames")
-axes[0].legend(loc="upper right"); axes[0].grid(alpha=.25)
-# Robust zoom: use active-frame 1st–99th percentiles and add margin. Keep a minimum
-# y-span so near-constant data is honestly shown rather than magnified infinitely.
-if flat_active.size:
-    lo, hi = np.percentile(flat_active, [1, 99])
-    span = max(float(hi - lo), 0.02)
-    zoom_bottom = max(0.0, float(lo) - 0.15 * span)
-    zoom_top = min(1.0, float(hi) + 0.15 * span)
-    if zoom_top - zoom_bottom < 0.02:
-        zoom_top = min(1.0, zoom_bottom + 0.02)
-else:
-    zoom_bottom, zoom_top = 0.0, 1.0
-axes[1].plot(times, np.where(active, flat, np.nan), linewidth=.65, alpha=.55, label="Active frames")
-axes[1].plot(times, np.where(active, d["flat_smooth"], np.nan), linewidth=1.2, label="Smoothed active frames")
-axes[1].set_ylim(zoom_bottom, zoom_top)
-axes[1].set_ylabel("Flatness (zoomed)"); axes[1].set_xlabel("Time (s)")
-axes[1].set_title(f"Active-frame detail — y-axis {zoom_bottom:.3f} to {zoom_top:.3f}")
-axes[1].legend(loc="upper right"); axes[1].grid(alpha=.25)
-if flat_active.size:
-    axes[2].hist(flat_active, bins=30)
-    axes[2].axvline(q50, linestyle="--", label=f"Median {q50:.4f}")
-    axes[2].set_title("Distribution across active frames")
-    axes[2].set_xlabel("Spectral flatness"); axes[2].set_ylabel("Frame count")
-    axes[2].legend(); axes[2].grid(alpha=.2)
-else:
-    axes[2].text(.5, .5, "No active frames under the current energy threshold", ha="center", va="center")
-    axes[2].set_axis_off()
-st.pyplot(fig); plt.close(fig)
-# Threshold is computed only from active frames; inactive frames are excluded from flags.
-flat_cutoff = float(np.percentile(flat_active, 90)) if flat_active.size else 1.0
-high_flat = active & (flat >= flat_cutoff)
-st.caption(f"High-flatness review cue uses the active-frame 90th percentile ({flat_cutoff:.4f}); it highlights relative outliers in this recording, not confirmed background noise. Corrected calculation uses magnitude spectrum with librosa's standard power=2 definition.")
 
-st.subheader("4. Zero-crossing rate")
-fig, ax = plt.subplots(figsize=(12, 3))
-ax.plot(times, d["zcr"], linewidth=.8)
-ax.set_xlabel("Time (s)"); ax.set_ylabel("Zero-crossing rate")
-ax.grid(alpha=.25); fig.tight_layout(); st.pyplot(fig); plt.close(fig)
+def show_metrics(metrics):
+    cols = st.columns(3)
+    cols[0].metric('Waveform SNR', f"{metrics['snr_db']:.2f} dB")
+    cols[1].metric('Log-spectral distance', f"{metrics['log_spectral_distance_db']:.2f} dB")
+    corr = metrics['energy_contour_correlation']
+    cols[2].metric('Energy contour correlation', 'N/A' if corr is None else f'{corr:.3f}')
+    st.caption('These are descriptive, sample-aligned signal measurements. They are not emotion scores. SNR is sensitive to codec delay; no automatic time alignment is applied.')
 
-st.subheader("5. Open-source transcription model comparison")
-st.write("Compare Whisper with two different open-source ASR model families on the same audio. All models receive the same selected source (original or noise-reduced), making this a small controlled comparison. First-time runs download model weights and may take several minutes.")
-st.markdown("- **Whisper** — encoder-decoder ASR; already available above.\n- **Qwen3-ASR 0.6B** — multilingual ASR model.\n- **NVIDIA Parakeet CTC 1.1B** — Conformer/CTC-based English ASR model.")
-st.caption("The comparison reports transcripts and runtime, not an automatic accuracy score. To measure accuracy, compare each transcript against a verified reference transcript (e.g., word error rate).")
-comparison_source_choice = st.radio("Audio input for comparison", ["Original audio", "Noise-reduced audio"], horizontal=True,
-                                    help="Noise-reduced audio is available only if noise reduction was applied in the transcription section above during this page run.")
-comparison_models = st.multiselect("Models to run", ["Whisper base", "Qwen3-ASR 0.6B", "NVIDIA Parakeet CTC 1.1B"],
-                                   default=["Whisper base", "Qwen3-ASR 0.6B", "NVIDIA Parakeet CTC 1.1B"])
-comparison_language = st.selectbox("Language for comparison models", ["Auto-detect", "English"], index=1)
-comparison_clicked = st.button("Run model comparison", type="primary")
 
-if comparison_clicked:
-    comparison_audio = y.astype(np.float32).copy()
-    if comparison_source_choice == "Noise-reduced audio":
-        if importlib.util.find_spec("noisereduce") is None:
-            st.error("Noise-reduced comparison requires `noisereduce`. Install requirements-transcription.txt and restart Streamlit.")
-            st.stop()
-        import noisereduce as nr
-        with st.spinner("Preparing noise-reduced audio for all comparison models…"):
-            comparison_audio = nr.reduce_noise(y=comparison_audio, sr=sr, stationary=False, prop_decrease=0.65)
-    comparison_audio = librosa.resample(comparison_audio, orig_sr=sr, target_sr=16000) if sr != 16000 else comparison_audio
-    comparison_results = []
-    for selected_model in comparison_models:
-        started = time.perf_counter()
-        try:
-            if selected_model == "Whisper base":
-                if importlib.util.find_spec("faster_whisper") is None:
-                    raise ImportError("Missing optional dependency `faster-whisper`. Install requirements-transcription.txt and restart Streamlit.")
-                from faster_whisper import WhisperModel
-                with st.spinner("Loading Whisper base (first run downloads model weights)…"):
-                    whisper_model_compare = WhisperModel("base", device="cpu", compute_type="int8")
-                kwargs = {"beam_size": 5, "vad_filter": False}
-                if comparison_language == "English":
-                    kwargs["language"] = "en"
-                with st.spinner("Transcribing with Whisper base…"):
-                    segments, info = whisper_model_compare.transcribe(comparison_audio, **kwargs)
-                    segment_rows = list(segments)
-                transcript_text = " ".join(seg.text.strip() for seg in segment_rows).strip()
-                detected_language = f"{info.language} (p={info.language_probability:.2f})"
-            elif selected_model == "Qwen3-ASR 0.6B":
-                if importlib.util.find_spec("qwen_asr") is None:
-                    raise ImportError("Missing optional dependency `qwen-asr`. Install requirements-comparison.txt and restart Streamlit.")
-                import torch
-                from qwen_asr import Qwen3ASRModel
-                with st.spinner("Loading Qwen3-ASR 0.6B (first run downloads model weights)…"):
-                    qwen_model = Qwen3ASRModel.from_pretrained(
-                        "Qwen/Qwen3-ASR-0.6B",
-                        dtype=torch.float32,
-                        device_map="cpu",
-                        max_new_tokens=256,
-                    )
-                language_arg = "English" if comparison_language == "English" else None
-                with st.spinner("Transcribing with Qwen3-ASR 0.6B…"):
-                    qwen_results = qwen_model.transcribe(audio=(comparison_audio, 16000), language=language_arg)
-                transcript_text = str(qwen_results[0].text).strip() if qwen_results else ""
-                detected_language = getattr(qwen_results[0], "language", "unknown") if qwen_results else "unknown"
-            else:
-                if importlib.util.find_spec("transformers") is None or importlib.util.find_spec("torch") is None:
-                    raise ImportError("Missing optional dependencies `transformers` and/or `torch`. Install requirements-comparison.txt and restart Streamlit.")
-                from transformers import pipeline
-                # Parakeet expects 16 kHz audio. Keep inference on CPU for portability.
-                with st.spinner("Loading NVIDIA Parakeet CTC 1.1B (first run downloads model weights)…"):
-                    asr_pipe = pipeline("automatic-speech-recognition", model="nvidia/parakeet-ctc-1.1b", device=-1)
-                with st.spinner("Transcribing with NVIDIA Parakeet CTC 1.1B…"):
-                    parakeet_result = asr_pipe({"raw": comparison_audio, "sampling_rate": 16000})
-                transcript_text = str(parakeet_result.get("text", "")).strip()
-                detected_language = "English model (language not auto-detected)"
-            elapsed = time.perf_counter() - started
-            comparison_results.append({"Model": selected_model, "Status": "Completed", "Runtime (s)": round(elapsed, 2),
-                                       "Language": str(detected_language), "Transcript": transcript_text or "[No text returned]"})
-        except Exception as e:
-            elapsed = time.perf_counter() - started
-            comparison_results.append({"Model": selected_model, "Status": f"Failed: {type(e).__name__}", "Runtime (s)": round(elapsed, 2),
-                                       "Language": "—", "Transcript": str(e)})
-    if comparison_results:
-        result_df = pd.DataFrame(comparison_results)
-        st.dataframe(result_df, use_container_width=True, hide_index=True)
-        st.download_button("Download model comparison (CSV)", result_df.to_csv(index=False).encode("utf-8"),
-                           file_name="asr_model_comparison.csv", mime="text/csv")
+sender, receiver, protocol = st.tabs(['Sender & experiment', 'Receiver', 'Evaluation guide'])
+with sender:
+    st.subheader('1. Captured voice in noise')
+    source = st.selectbox('Recording', ['Upload a recording', 'Included clean sample', 'Included noisy sample'])
+    uploaded = st.file_uploader('Source audio · maximum 60 seconds', type=['wav','flac','ogg'], key='source') if source == 'Upload a recording' else None
+    raw = uploaded.getvalue() if uploaded else None
+    if source != 'Upload a recording':
+        raw = (ROOT/'samples'/('audio-without-noise.wav' if source == 'Included clean sample' else 'audio-with-noise.wav')).read_bytes()
+    if raw is None:
+        st.info('Upload your noisy file or select Included noisy sample. You can decode a packet in Receiver without the source recording.')
     else:
-        st.info("Select at least one comparison model to run.")
+        try:
+            original = read_audio(raw)
+            if len(original)<2400:
+                raise ValueError('Use at least 0.1 seconds of audio')
+            noisy = st.checkbox('Add controlled white noise', value=False)
+            snr = st.slider('Added noise SNR (dB)', -5, 30, 10, disabled=not noisy)
+            ground_truth, captured = add_noise(original,snr) if noisy else (None,original)
+            reference_digest='synthetic' if noisy else 'none'
+            if not noisy:
+                with st.expander('Optional: provide the matching clean speech for evaluation'):
+                    reference_choice=st.selectbox('Clean reference',['None','Upload clean reference','Included clean sample'])
+                    reference_file=st.file_uploader('Aligned clean reference',type=['wav','flac','ogg'],key='clean_reference') if reference_choice=='Upload clean reference' else None
+                    reference_raw=reference_file.getvalue() if reference_file else None
+                    if reference_choice=='Included clean sample':
+                        reference_raw=(ROOT/'samples/audio-without-noise.wav').read_bytes()
+                    confirmed=st.checkbox('I confirm the reference contains the same speech, aligned in time and level',disabled=reference_raw is None)
+                    if reference_raw is not None and confirmed:
+                        candidate=read_audio(reference_raw)
+                        if len(candidate)!=len(captured):
+                            st.warning('Reference duration differs. Align the recordings before using them for ground-truth metrics; this reference will not be used.')
+                        else:
+                            ground_truth=candidate
+                            reference_digest=hashlib.sha256(reference_raw).hexdigest()
+            st.audio(wav_bytes(captured),format='audio/wav')
+            st.caption(f'Captured recording · {len(captured)/24000:.2f} s · 24 kHz mono. For your already noisy file, leave added noise off.')
 
-feature_df = pd.DataFrame({"time_s": times, "rms_db_relative": d["rms_db"], "pitch_hz": d["f0"],
-                           "pitch_frame_retained": d["pitch_valid"], "spectral_flatness": flat,
-                           "spectral_flatness_smoothed": d["flat_smooth"], "active_energy_frame": active,
-                           "high_spectral_flatness_flag": high_flat,
-                           "zero_crossing_rate": d["zcr"]})
-with st.expander("Analysis settings and caveats"):
-    st.write(f"FFT window: {d['n_fft']} samples ({1000*d['n_fft']/sr:.1f} ms); hop: {1000*d['hop']/sr:.1f} ms.")
-    st.write(f"Active-frame threshold: {d['active_threshold']:.1f} dB relative RMS level. Quiet threshold: {d['quiet_threshold_db']:.1f} dB relative RMS level. High-flatness cue: active-frame 90th percentile ({flat_cutoff:.4f}).")
-    st.write("Spectral flatness depends on window size, frequency content, and recording conditions. Validate with known clean speech, silence, and noise before using it as a triage cue.")
+            st.subheader('2. Reduce background noise and raise the voice level')
+            denoise=st.checkbox('Apply noise reduction before encoding',value=True)
+            enhancer=st.selectbox('Speech enhancement model',['deepfilter','mossformer','spectral'],format_func=lambda key:ENHANCERS[key],disabled=not denoise)
+            if enhancer=='spectral':
+                strength=st.slider('Noise reduction strength',0.,1.,.5,.05,disabled=not denoise)
+                noise_mode=st.selectbox('Background noise type',['Changing background noise','Steady hiss / white noise'],disabled=not denoise)
+            else:
+                strength=st.slider('Enhanced audio mix',0.,1.,1.,.05,disabled=not denoise,
+                    help='1 uses the neural model output; lower values blend back the original recording. This is a mix, not calibrated noise attenuation.')
+                noise_mode='Neural enhancement'
+                st.caption('Pretrained neural enhancement runs locally at 48 kHz using the same Python environment, then returns to the 24 kHz pipeline. No silent fallback to spectral gating.')
+            boost=st.checkbox('Boost voice level after noise reduction',value=True)
+            boost_db=st.slider('Requested voice boost (dB)',0.,24.,9.,1.,disabled=not boost)
+            with st.spinner('Reducing noise and raising speech level…'):
+                started=time.perf_counter()
+                prepared,processing=prepare_speech(captured,denoise,strength,boost_db if boost else 0.,noise_mode=='Steady hiss / white noise',enhancer)
+                preprocessing_s=time.perf_counter()-started
+            st.audio(wav_bytes(prepared),format='audio/wav')
+            level_columns=st.columns(3)
+            level_columns[0].metric('Applied voice boost',f"{processing['applied_gain_db']:.1f} dB")
+            level_columns[1].metric('Level after noise reduction',f"{processing['cleaned_rms_dbfs']:.1f} dBFS")
+            level_columns[2].metric('Final processed level',f"{processing['output_rms_dbfs']:.1f} dBFS")
+            if processing['peak_limited']:
+                st.info('Applied gain was limited to keep peaks below −1 dBFS. Lower the requested boost if you want less amplification.')
+            st.download_button('Download processed speech',wav_bytes(prepared),'processed_speech.wav','audio/wav')
+            st.caption('Noise suppression comes first, then one uniform gain raises the remaining voice and any residual noise. Peaks stay below −1 dBFS without dynamic compression. Relative emphasis and timing are preserved by the gain stage. This is noise suppression, not perfect speaker isolation.')
+
+            enhancement_id=hashlib.sha256(raw+captured.tobytes()).hexdigest()+reference_digest
+            if st.session_state.get('enhancement_compare_id')!=enhancement_id:
+                st.session_state.pop('enhancement_comparison',None)
+                st.session_state.enhancement_compare_id=enhancement_id
+            if st.button('Compare enhancement models (boost off)'):
+                candidates=[]
+                for backend in ['spectral','deepfilter','mossformer']:
+                    try:
+                        with st.spinner(f'Comparing {ENHANCERS[backend]}…'):
+                            start=time.perf_counter()
+                            signal,details=prepare_speech(captured,True,.5 if backend=='spectral' else 1.,0.,False,backend)
+                            elapsed=time.perf_counter()-start
+                            measured=compare_audio(ground_truth,signal) if ground_truth is not None else None
+                            candidates.append(dict(model=ENHANCERS[backend],status='Completed',seconds=elapsed,
+                                wav=wav_bytes(signal),processing=details,source_sha256=hashlib.sha256(raw).hexdigest(),clean_reference_kind=reference_digest,clean_reference=measured))
+                    except Exception as exc:
+                        candidates.append(dict(model=ENHANCERS[backend],status=f'Failed: {exc}'))
+                st.session_state.enhancement_comparison=candidates
+            comparison=st.session_state.get('enhancement_comparison')
+            if comparison:
+                st.caption('Same captured input, boost off. Spectral baseline strength 0.5; neural outputs at full mix. Times include worker/model startup unless cached. Listen for changes to words and delivery.')
+                for candidate in comparison:
+                    st.write(candidate['model'])
+                    if candidate['status']=='Completed':
+                        st.audio(candidate['wav'],format='audio/wav')
+                        if candidate['clean_reference']:
+                            show_metrics(candidate['clean_reference'])
+                    else:
+                        st.warning(candidate['status'])
+                summary=[{k:v for k,v in item.items() if k!='wav'} for item in comparison]
+                st.download_button('Download enhancement comparison report',json.dumps(summary,indent=2,allow_nan=False),'enhancement_comparison.json','application/json')
+
+            audio_id=hashlib.sha256(raw+captured.tobytes()).hexdigest()+str((denoise,strength if denoise else None,boost_db if boost else 0.,noise_mode if denoise else None,enhancer if denoise else None))
+            if st.session_state.get('pipeline_audio_id')!=audio_id:
+                for key in ['transcript_rows','transcript_language','transcript_revision','emotion_settings']:
+                    st.session_state.pop(key,None)
+                st.session_state.pipeline_audio_id=audio_id
+            st.subheader('3. Optional transcript and emotion colors')
+            st.write('The words help you read and review the speech. The audio continues directly to the codec in stage 4; it is not regenerated from this transcript.')
+            st.caption('Transcription can invent or miss words in noise. Check the words against playback before treating them as accurate.')
+            if st.button('Transcribe processed speech locally'):
+                try:
+                    from textuplink.transcript import transcribe_words
+                    with st.spinner('Transcribing with local Qwen3-ASR and aligning word times…'):
+                        rows,language=transcribe_words(prepared,get_transcriber())
+                    st.session_state.transcript_rows=rows
+                    st.session_state.transcript_language=language
+                    st.session_state.transcript_revision=st.session_state.get('transcript_revision',0)+1
+                    st.session_state.pop('emotion_settings',None)
+                except Exception as exc:
+                    st.error(f'Transcription failed: {exc}. Provision Qwen with python scripts/provision_models.py qwen and python scripts/provision_models.py aligner.')
+            rows=st.session_state.get('transcript_rows')
+            if rows is not None:
+                if not rows:
+                    st.info('No words returned. Listen to the processed audio and reduce denoising strength if speech was lost.')
+                else:
+                    from textuplink.transcript import LABELS, LocalEmotion, review_annotations, colored_html
+                    emotion_input=st.radio('Voice used for emotion estimates',['Captured voice','Processed voice'],horizontal=True)
+                    threshold=st.slider('Minimum model score for a colored estimate',.25,.95,.6,.05)
+                    if st.button('Estimate phrase emotion locally'):
+                        try:
+                            from textuplink.transcript import annotate_context
+                            with st.spinner('Estimating emotion in short speech contexts…'):
+                                rows=annotate_context(rows,captured if emotion_input=='Captured voice' else prepared,get_emotion_model(),threshold)
+                            st.session_state.transcript_rows=rows
+                            st.session_state.transcript_revision=st.session_state.get('transcript_revision',0)+1
+                            st.session_state.emotion_settings=dict(input=emotion_input,threshold=threshold)
+                        except Exception as exc:
+                            st.error(f'Emotion estimates unavailable: {exc}')
+                    st.caption('English utterance-emotion baseline with four categories; not validated for emergency/radio speech. Orange: angry · green: happy · blue: sad · slate: neutral · gray: uncertain/unlabelled. Automatic colors are phrase-context predictions assigned to words by timing, not independent word-level emotion measurements. Model scores are not calibrated probabilities of true emotion.')
+                    saved=st.session_state.get('emotion_settings')
+                    if saved:
+                        st.caption(f"Displayed model estimates: {saved['input']}, threshold {saved['threshold']:.2f}. Click Estimate again to apply changed settings.")
+                    frame=pd.DataFrame(rows)
+                    edited=st.data_editor(frame,key=f"transcript_editor_{audio_id}_{st.session_state.get('transcript_revision',0)}",hide_index=True,
+                        disabled=[c for c in frame.columns if c not in ['word','emotion']],
+                        column_config={'emotion':st.column_config.SelectboxColumn('Emotion annotation',options=LABELS,required=True)})
+                    reviewed=review_annotations(edited.to_dict('records'),rows)
+                    st.markdown(colored_html(reviewed),unsafe_allow_html=True)
+                    st.caption('Hover over words for timing and annotation source. You can correct words and assign emotion labels manually. Corrections do not realign word times. Colors annotate the display; they do not control the decoder.')
+                    sidecar=json.dumps(dict(schema='textuplink.transcript.v1',asr_model='Qwen/Qwen3-ASR-0.6B',alignment_model='Qwen/Qwen3-ForcedAligner-0.6B',source_sha256=hashlib.sha256(raw).hexdigest(),
+                        processed_audio_sha256=hashlib.sha256(prepared.tobytes()).hexdigest(),noise_snr_db=snr if noisy else None,
+                        language=st.session_state.transcript_language,denoised=denoise,noise_reduction_strength=strength if denoise else None,
+                        processing=processing,emotion_settings=saved,words=reviewed),ensure_ascii=False,indent=2,allow_nan=False)
+                    st.download_button('Download annotated transcript JSON',sidecar,'annotated_transcript.json','application/json')
+                    st.caption(f'Transcript sidecar: {len(sidecar.encode()):,} bytes. It is separate from the audio packet; transmitting both costs the sum of their sizes.')
+
+            st.subheader('4. Encode processed voice into a small packet')
+            family = st.selectbox('Neural codec', ['encodec','mimi','focalcodec'], format_func=lambda f:{'encodec':'Meta EnCodec · 24 kHz','mimi':'Kyutai Mimi · 24 kHz','focalcodec':'FocalCodec · 16 kHz / 0.65 kb/s'}[f])
+            if family == 'encodec':
+                setting = st.select_slider('Codec target bitrate (kb/s)', options=[1.5,3.,6.,12.,24.],value=3.)
+                nominal = setting
+            elif family=='mimi':
+                setting = st.select_slider('Mimi codebooks', options=[4,8,16,32],value=8)
+                nominal = setting*12.5*11/1000
+                st.caption(f'Nominal code rate: {nominal:.3f} kb/s before packet overhead.')
+            else:
+                setting=.65
+                nominal=.65
+                st.caption('FocalCodec uses 13-bit tokens at 50 Hz. This checkpoint is fixed at nominal 0.65 kb/s. Audio is resampled to 16 kHz internally; the WAV is returned at 24 kHz for comparison, without restoring lost high frequencies.')
+            st.write('The encoder compresses the processed waveform, including the acoustic cues to delivery. No emotion label is required by the codec. Lower rates can lose speech and expression.')
+            identity=audio_id+str((family,setting,reference_digest))
+            if st.session_state.get('experiment_id')!=identity:
+                st.session_state.pop('experiment',None)
+                st.session_state.pop('rate_sweep',None)
+                st.session_state.pop('codec_comparison',None)
+                st.session_state.experiment_id=identity
+            if st.button('Encode packet → reconstruct voice',type='primary'):
+                try:
+                    with st.spinner('Encoding and decoding locally…'):
+                        model=get_codec(family)
+                        packet,encode_s=model.encode(prepared,setting)
+                        reconstructed,decode_s=model.decode(packet)
+                        seconds=len(captured)/24000
+                        header,_=unpack_codes(packet)
+                        report=dict(codec=family,setting=setting,model_fingerprint=header['fingerprint'],source_sha256=hashlib.sha256(raw).hexdigest(),
+                            duration_s=seconds,noise_snr_db=snr if noisy else None,denoised=denoise,noise_reduction_strength=strength if denoise else None,
+                            packet_bytes=len(packet),packet_kbps=len(packet)*8/seconds/1000,
+                            nominal_kbps=nominal,pcm16_kbps=384.,compression_vs_pcm16=(len(captured)*2)/len(packet),
+                            processing=processing,preprocessing_s=preprocessing_s,encode_s=encode_s,decode_s=decode_s,
+                            realtime_factor=(encode_s+decode_s)/seconds,
+                            captured_reference=compare_audio(captured,reconstructed),
+                            codec_input_reference=compare_audio(prepared,reconstructed),
+                            clean_reference=compare_audio(ground_truth,reconstructed) if ground_truth is not None else None,
+                            clean_reference_kind=reference_digest,
+                            caveats='Offline batch file experiment; not streaming latency. No encryption or transport overhead. No automatic delay correction. No validated emotion score. Transcription and colors are a separate sidecar, excluded from audio packet bitrate.')
+                        st.session_state.experiment=dict(packet=packet,wav=wav_bytes(reconstructed),report=report)
+                except Exception as exc:
+                    st.error(f'Codec experiment failed: {exc}')
+                    st.info(f'Provision {family} locally first: python scripts/provision_models.py {family}.')
+            if st.button('Compare bitrate settings'):
+                try:
+                    with st.spinner('Comparing codec settings on the same processed speech…'):
+                        model=get_codec(family)
+                        sweep=[]
+                        for value in ([1.5,3.,6.,12.,24.] if family=='encodec' else ([.65] if family=='focalcodec' else [4,8,16,32])):
+                            packet,enc=model.encode(prepared,value)
+                            reconstructed,dec=model.decode(packet)
+                            reference=ground_truth if ground_truth is not None else prepared
+                            measured=compare_audio(reference,reconstructed)
+                            sweep.append({'Setting':value,'Actual kb/s':len(packet)*8/(len(captured)/24000)/1000,
+                                'Packet bytes':len(packet),'Encode s':enc,'Decode s':dec,
+                                'Reference':'Clean ground truth' if ground_truth is not None else 'Processed codec input',
+                                'Log-spectral distance (dB)':measured['log_spectral_distance_db'],
+                                'Energy contour correlation':measured['energy_contour_correlation']})
+                        st.session_state.rate_sweep=sweep
+                except Exception as exc:
+                    st.error(f'Bitrate comparison failed: {exc}')
+            if st.button('Compare codecs on this processed speech'):
+                outcomes=[]
+                for backend,value in [('encodec',3.),('mimi',8),('focalcodec',.65)]:
+                    try:
+                        with st.spinner(f'Running {backend} on the same processed speech…'):
+                            model=get_codec(backend)
+                            packet,enc=model.encode(prepared,value)
+                            signal,dec=model.decode(packet)
+                            measured=compare_audio(ground_truth if ground_truth is not None else prepared,signal)
+                            outcomes.append(dict(codec=backend,setting=value,status='Completed',packet_kbps=8*len(packet)/(len(prepared)/24000)/1000,
+                                packet_bytes=len(packet),encode_s=enc,decode_s=dec,metrics=measured,
+                                reference='Clean ground truth' if ground_truth is not None else 'Processed codec input',
+                                source_sha256=hashlib.sha256(raw).hexdigest(),processing=processing,
+                                model_fingerprint=unpack_codes(packet)[0]['fingerprint'],wav=wav_bytes(signal),packet=packet))
+                    except Exception as exc:
+                        outcomes.append(dict(codec=backend,status=f'Failed: {exc}'))
+                st.session_state.codec_comparison=outcomes
+            outcomes=st.session_state.get('codec_comparison')
+            if outcomes:
+                st.caption('These settings have different bitrates. Compare actual size and listening quality; the app does not rank emotional fidelity. FocalCodec is band-limited to 16 kHz sampling.')
+                for item in outcomes:
+                    st.write(item['codec'])
+                    if item['status']=='Completed':
+                        st.audio(item['wav'],format='audio/wav')
+                        st.caption(f"{item['packet_kbps']:.3f} kb/s · {item['packet_bytes']:,} bytes")
+                        st.download_button(f"Download {item['codec']} packet",item['packet'],f"{item['codec']}.tuplink",'application/octet-stream')
+                    else:
+                        st.warning(item['status'])
+                summary=[{k:v for k,v in item.items() if k not in ['wav','packet']} for item in outcomes]
+                st.download_button('Download codec comparison report',json.dumps(summary,indent=2,allow_nan=False),'codec_comparison.json','application/json')
+            sweep=st.session_state.get('rate_sweep')
+            if sweep:
+                frame=pd.DataFrame(sweep)
+                st.scatter_chart(frame,x='Actual kb/s',y='Log-spectral distance (dB)')
+                st.dataframe(frame,hide_index=True)
+                st.caption('Lower spectral distance is closer under this metric, not proof of preserved emotion. Select individual settings to listen.')
+                st.download_button('Download bitrate comparison',frame.to_csv(index=False),'bitrate_comparison.csv','text/csv')
+            st.subheader('5. Decode packet → reconstructed voice')
+            result=st.session_state.get('experiment')
+            if result:
+                report=result['report']
+                st.audio(result['wav'],format='audio/wav')
+                cols=st.columns(3)
+                cols[0].metric('Actual audio packet bitrate',f"{report['packet_kbps']:.3f} kb/s")
+                cols[1].metric('Audio packet size',f"{report['packet_bytes']:,} bytes")
+                cols[2].metric('Compression vs 24 kHz mono PCM16',f"{report['compression_vs_pcm16']:.1f}×")
+                st.caption(f"Encode {report['encode_s']:.2f}s · decode {report['decode_s']:.2f}s · combined real-time factor {report['realtime_factor']:.2f}. Transcript sidecar and network/security overhead are excluded.")
+                st.write('Compared with processed speech: isolates what compression changed.')
+                show_metrics(report['codec_input_reference'])
+                if report['clean_reference']:
+                    st.write('Compared with clean ground truth: evaluates the complete noise-reduction and compression pipeline.')
+                    st.audio(wav_bytes(ground_truth),format='audio/wav')
+                    show_metrics(report['clean_reference'])
+                else:
+                    st.info('Add an aligned clean reference above to measure closeness to clean speech. Without it, we can only compare against the captured or processed recording.')
+                st.download_button('Download sender packet',result['packet'],'speech.tuplink','application/octet-stream')
+                st.download_button('Download reconstructed WAV',result['wav'],'reconstructed.wav','audio/wav')
+                st.download_button('Download experiment report',json.dumps(report,indent=2,allow_nan=False),'experiment.json','application/json')
+            else:
+                st.info('Click Encode packet → reconstruct voice in stage 4. Then compare this output with stages 1 and 2 and your clean reference.')
+        except Exception as exc:
+            st.error(f'Could not prepare source audio: {exc}')
+with receiver:
+    st.subheader('Reconstruct from a sender packet')
+    st.write('The receiver only needs the packet and the matching preinstalled model. It does not need the source recording or a transcript.')
+    incoming=st.file_uploader('Upload .tuplink packet',type=['tuplink'],key='receiver_packet')
+    if incoming is not None:
+        packet=incoming.getvalue()
+        digest=hashlib.sha256(packet).hexdigest()
+        if st.session_state.get('receiver_id') != digest:
+            st.session_state.pop('receiver_wav',None)
+            st.session_state.receiver_id=digest
+        try:
+            header,_=unpack_codes(packet)
+            st.write(f"Codec: {header['family']} · duration: {header['samples']/24000:.2f}s · packet: {len(packet):,} bytes")
+            if st.button('Decode received packet'):
+                with st.spinner('Reconstructing locally…'):
+                    audio,elapsed=get_codec(header['family']).decode(packet)
+                    st.session_state.receiver_wav=wav_bytes(audio)
+                    st.success(f'Decoded in {elapsed:.2f}s')
+            if 'receiver_wav' in st.session_state:
+                st.audio(st.session_state.receiver_wav,format='audio/wav')
+                st.download_button('Save receiver WAV',st.session_state.receiver_wav,'received.wav','audio/wav')
+        except Exception as exc:
+            st.error(f'Cannot decode packet: {exc}')
+    st.caption('Packets are currently unencrypted. Integrity checks detect accidental payload corruption; they do not authenticate the sender. This tab simulates the transport boundary using a file.')
+with protocol:
+    st.subheader('Test the premise, not just transcription')
+    st.markdown('''1. Record the same words with different delivery: calm, urgent, questioning, whispered and shouted.
+2. Keep clean recordings as ground truth. Add controlled noise to create aligned test inputs.
+3. Compare codec rates on identical inputs, with and without noise reduction.
+4. Ask listeners to rate intelligibility, speaker similarity and expressive similarity without seeing the codec setting.
+5. Report actual packet bitrate, encode/decode time and failures alongside listener scores.''')
+    st.write('Text is a compact content baseline, but it omits much of the original delivery. Acoustic tokens provide a tunable tradeoff between bandwidth and reconstruction fidelity. Neither codec guarantees that emotion is preserved.')
+    st.write('Start with pretrained encoder/quantizer/decoder systems. Train or fine-tune only after the benchmark reveals specific failures. A standalone vocoder still needs an encoder and a compact conditioning representation.')
+    st.write('AudioCraft offers EnCodec training and MultiBand Diffusion decoders for compatible EnCodec tokens. These are follow-up experiments; this app uses the Transformers EnCodec and Mimi implementations.')
+    st.caption('Codecs use local CPU batch inference; neural enhancement uses Apple Silicon Metal. Maximum 60 seconds. WAV/FLAC/OGG supported by libsndfile. Stereo is downmixed. No real-time radio, packet-loss recovery, encryption or training loop is implemented. The optional emotion classifier is an exploratory phrase-level baseline, not a validated measure of emotional state.')
