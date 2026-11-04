@@ -10,3 +10,4 @@ safetensors>=0.4
 noisereduce>=3
 qwen-asr==0.0.6
 mlx==0.32.4; sys_platform == "darwin" and platform_machine == "arm64"
+streamlit-webrtc==0.79.0

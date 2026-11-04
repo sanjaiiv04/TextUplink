@@ -94,7 +94,7 @@ Spectral gating is a baseline. Neural failures surface without silent fallback.
 ## Scope
 
 Uploaded audio files only, up to 60 seconds. Stereo is downmixed; this
-prototype cannot separate named speakers or preserve spatial direction. No streaming,
+prototype cannot separate named speakers or preserve spatial direction. No native streaming ASR,
 speaker diarization, speaker baseline tracking, wearable integration or validated emotion
 benchmark is implemented. Complete noise removal and unchanged delivery are not guaranteed.
 Codec packets, compression, decoding and receiver workflows have been removed.
@@ -106,3 +106,24 @@ Sources:
 - https://huggingface.co/superb/wav2vec2-base-superb-er
 - https://github.com/Rikorose/DeepFilterNet
 - https://github.com/modelscope/ClearerVoice-Studio
+
+## Live transcription
+
+`textuplink/live_transcription.py` uses streamlit-webrtc 0.79.0 with an audio-only
+SENDONLY connection and a CallbackSinkTrack. ICE server lists are explicitly empty
+on both peers, and audio is not echoed. Run through localhost with browser microphone
+permission. This is a Mac/browser hardware prototype, not a phone-to-Mac bridge.
+
+The capture callback only resamples frames with PyAV to 16 kHz float mono and appends
+to a thread-safe buffer. A background worker calls local Qwen3-ASR without timestamps;
+forced alignment and enhancement do not run. A shared model lock serializes live and
+recorded-file ASR calls. A Streamlit fragment refreshes text/status once per second.
+Segments close after five seconds or a simple quiet-level pause; boundary words can
+be split. Digitally silent/near-silent chunks are skipped using an RMS heuristic,
+which is not a trained voice activity detector and cannot reliably reject noise.
+
+At most six segments wait for inference. If overloaded, older queued segments are
+discarded and explicitly counted in the UI; this does not guarantee lossless real-time
+transcription. STOP flushes the final segment, and an audio-idle timeout closes abandoned
+sessions. Starting a new prepared session resets its transcript. Export times refer to
+capture segments, not individual words. Qwen3's vLLM native streaming API is not used.
