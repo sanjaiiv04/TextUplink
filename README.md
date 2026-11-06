@@ -54,14 +54,26 @@ troubleshooting, see [Glasses microphone setup](docs/GLASSES_MIC_SETUP.md).
 
 ## Live Qwen3 transcription
 
-1. Open **Live transcription** and click **Prepare local Qwen3 microphone**.
+1. Open **Live transcription**, choose **Apple GPU (MPS)** when offered, then click
+   **Prepare local Qwen3 microphone** and wait for warm-up.
 2. Choose the Ray-Ban microphone in the component's device selector and Brave settings.
-3. Click **START** and speak; text appears after a pause or about five seconds,
-   plus processing time. Click **STOP** to finish the last segment.
+3. Click **START**. A draft is requested after about one second plus inference time. Pause or
+   click **STOP** to finalize the phrase.
 4. Download plain text or timed segment data if needed.
 
-The local Transformers model transcribes short batches; this is not native token-by-token
-streaming. Audio capture continues in a separate path during inference. The UI shows input
-level, pending segments and any discarded audio if the model cannot keep up. Updates can
-lag on CPU. Live audio is not enhanced or emotion-labelled. Use `localhost` on this Mac;
-no external STUN/TURN relay is configured. Silence suppression is a simple level heuristic.
+The local Transformers model re-transcribes growing phrase snapshots; this is not native
+streaming. Drafts can revise earlier words. Final phrases retain their full context up to
+a 10-second cap. Capture continues separately, and the UI shows inference time, queue/model
+wait and server-audio-to-result delay. If the model falls too far behind, capture stops
+rather than discarding accepted final audio. Live audio is not enhanced or emotion-labelled.
+Use `localhost` on this Mac; no external STUN/TURN relay is configured. Quiet detection is
+heuristic. See the setup notes for measured timings, debugging and reproduction steps.
+
+## Emotion lab · Stage 1
+
+Stop live capture, then record/upload the same short phrase with different intended
+deliveries. The new local emotion2vec+ large model supports nine labels, including
+surprise and fear. The lab shows alternatives, compares the old model, withholds
+ambiguous decisions and exports a session test log. Automatic wearer cues are not
+enabled. Anger requires corroboration from the comparison model. See the setup notes
+for exact gates, limitations, model version and the staged testing plan.

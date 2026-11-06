@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import threading
+import time
 from pathlib import Path
 import pandas as pd
 import numpy as np
@@ -39,11 +40,26 @@ def delivery(rows,audio):return measure_delivery(rows,audio)
 @st.cache_resource
 def transcription_lock():return threading.Lock()
 
-captions_tab,microphone_tab,live_tab=st.tabs(['Expressive captions','Microphone test','Live transcription'])
+@st.cache_resource(max_entries=2)
+def live_transcriber(device):
+    import torch
+    started=time.perf_counter()
+    model=load_transcriber(ROOT,with_alignment=False,device=device)
+    loaded=time.perf_counter()
+    with transcription_lock():
+        model.transcribe(audio=(np.zeros(32000,dtype=np.float32),16000),language='English',return_time_stamps=False)
+        if device=='mps':torch.mps.synchronize()
+    return model,dict(device=device,model_load_s=loaded-started,warmup_s=time.perf_counter()-loaded)
+
+captions_tab,microphone_tab,live_tab,emotion_tab=st.tabs(['Expressive captions','Microphone test','Live transcription','Emotion lab · Stage 1'])
+
+with emotion_tab:
+    from textuplink.emotion import render_emotion_lab
+    render_emotion_lab(ROOT,emotion_model)
 
 with live_tab:
     from textuplink.live_transcription import render_live_tab
-    render_live_tab(transcriber,transcription_lock)
+    render_live_tab(live_transcriber,transcription_lock)
 
 with microphone_tab:
     st.subheader('Record, listen, and save a WAV')

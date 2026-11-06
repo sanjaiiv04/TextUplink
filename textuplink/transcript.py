@@ -8,7 +8,7 @@ COLORS = {'Unlabelled':'#64748b', 'Uncertain':'#64748b', 'Neutral':'#475569',
 MODEL_LABELS = {'neu':'Neutral', 'hap':'Happy', 'ang':'Angry', 'sad':'Sad'}
 
 
-def load_transcriber(root):
+def load_transcriber(root, *, with_alignment=True, device='cpu'):
     import torch
     from qwen_asr import Qwen3ASRModel
     from huggingface_hub import snapshot_download
@@ -17,9 +17,9 @@ def load_transcriber(root):
     aligner=root/'models/qwen3-aligner'
     return Qwen3ASRModel.from_pretrained(
         str(asr) if asr.is_dir() else snapshot_download('Qwen/Qwen3-ASR-0.6B',local_files_only=True),
-        dtype=torch.float32,device_map='cpu',local_files_only=True,
+        dtype=torch.float32,device_map=device,local_files_only=True,
         max_inference_batch_size=1,max_new_tokens=1024,
-        forced_aligner=str(aligner) if aligner.is_dir() else snapshot_download('Qwen/Qwen3-ForcedAligner-0.6B',local_files_only=True),
+        forced_aligner=(str(aligner) if aligner.is_dir() else snapshot_download('Qwen/Qwen3-ForcedAligner-0.6B',local_files_only=True)) if with_alignment else None,
         forced_aligner_kwargs=dict(dtype=torch.float32,device_map='cpu',local_files_only=True))
 
 

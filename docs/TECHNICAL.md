@@ -114,16 +114,36 @@ SENDONLY connection and a CallbackSinkTrack. ICE server lists are explicitly emp
 on both peers, and audio is not echoed. Run through localhost with browser microphone
 permission. This is a Mac/browser hardware prototype, not a phone-to-Mac bridge.
 
-The capture callback only resamples frames with PyAV to 16 kHz float mono and appends
-to a thread-safe buffer. A background worker calls local Qwen3-ASR without timestamps;
-forced alignment and enhancement do not run. A shared model lock serializes live and
-recorded-file ASR calls. A Streamlit fragment refreshes text/status once per second.
-Segments close after five seconds or a simple quiet-level pause; boundary words can
-be split. Digitally silent/near-silent chunks are skipped using an RMS heuristic,
-which is not a trained voice activity detector and cannot reliably reject noise.
+The capture callback resamples frames with PyAV to 16 kHz float mono and appends to a
+thread-safe phrase buffer. Every second a provisional full-phrase snapshot becomes
+available for local Qwen inference. Newer pending drafts coalesce; the final phrase
+retains all its audio. Final phrases have priority, and their queue never discards
+accepted audio. If six final phrases are waiting, capture closes with an explicit
+error and processes the accepted tail. A quiet pause of 350 ms or a 10-second cap
+finalizes a phrase. Boundary words can still be split at the cap.
 
-At most six segments wait for inference. If overloaded, older queued segments are
-discarded and explicitly counted in the UI; this does not guarantee lossless real-time
-transcription. STOP flushes the final segment, and an audio-idle timeout closes abandoned
-sessions. Starting a new prepared session resets its transcript. Export times refer to
-capture segments, not individual words. Qwen3's vLLM native streaming API is not used.
+The UI distinguishes revisable drafts from final text and exports only finalized
+phrases. A shared model lock prevents simultaneous live/recorded Qwen inference.
+The fragment refresh interval is 250 ms. Each update records queue wait, model-lock
+wait, inference duration, input duration and last-server-sample-to-result delay.
+This is not a physical mouth-to-screen measurement; Bluetooth/browser capture and
+up to one display interval are outside it.
+
+The separate live loader omits alignment and selects MPS when available, with CPU
+explicitly selectable between sessions. A silent two-second warm-up runs before
+capture and is discarded. Recorded caption alignment remains on the original CPU
+path. Model loading failures are visible, without silently changing devices.
+The artifact `嗯。` is suppressed only when it is the complete recognized output.
+
+Warm-up/startup and CPU/MPS measurements, exact user setup and new debugging steps
+are recorded in `docs/GLASSES_MIC_SETUP.md`. Update that guide after future changes.
+
+## Stage 1 emotion evaluation
+
+`textuplink/emotion.py` implements local emotion2vec+ large through FunASR 1.4.22,
+whole-phrase score validation, quality/ambiguity gates, comparison with the existing
+four-class model and a session-only evaluation log. It runs on 16 kHz mono CPU input
+with no word alignment or pitch-to-emotion rule. The candidate is not yet integrated
+into live capture or audio cue playback. Exact source revision, checkpoint hash,
+thresholds, offline test results and reproduction steps are maintained in
+`docs/GLASSES_MIC_SETUP.md` under the November 6 Stage 1 section.

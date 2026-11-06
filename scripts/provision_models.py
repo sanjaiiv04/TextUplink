@@ -93,7 +93,8 @@ def provision_reuse(destination,local_only=False):
     (destination/'manifest.json').write_text(json.dumps(dict(repo='nvidia/NVIDIA-NemotronLabs-RE-USE',
         revision=REUSE_REVISION,runtime='SpeechLens CLI v1.0 (strict)',runtime_archive_sha256=REUSE_CLI_SHA256,sha256=artifacts),indent=2))
 
-REPOS = {'emotion': ('superb/wav2vec2-base-superb-er','emotion'),
+REPOS = {'emotion2vec': ('emotion2vec/emotion2vec_plus_large','emotion2vec_plus_large'),
+         'emotion': ('superb/wav2vec2-base-superb-er','emotion'),
          'qwen': ('Qwen/Qwen3-ASR-0.6B','qwen3-asr'),
          'aligner': ('Qwen/Qwen3-ForcedAligner-0.6B','qwen3-aligner'),
          'deepfilter': ('mlx-community/DeepFilterNet-mlx','deepfilternet3'),
@@ -113,6 +114,8 @@ def main():
         print(f'RE-USE ready for offline inference at {destination}')
         return
     patterns=['config.json','*.safetensors','*.safetensors.index.json']
+    if args.model=='emotion2vec':
+        patterns=['config.yaml','configuration.json','model.pt','tokens.txt','README.md']
     if args.model=='emotion':
         from huggingface_hub import list_repo_files
         files=list_repo_files(repo)
@@ -124,7 +127,8 @@ def main():
         patterns=['v3/config.json','v3/model.safetensors']
     if args.model=='mossformer':
         patterns=['model_fp32.safetensors']
-    snapshot_download(repo_id=repo,local_dir=str(destination),allow_patterns=patterns,local_files_only=args.local_only)
+    snapshot_download(repo_id=repo,local_dir=str(destination),allow_patterns=patterns,local_files_only=args.local_only,
+                      revision='6c303ba987b86b93193de93e34bb2b077a6bedc4' if args.model=='emotion2vec' else None)
     if args.model=='mossformer':
         import json
         # Default MossFormer2SEConfig from the pinned mlx-audio 0.6.2 runtime.
