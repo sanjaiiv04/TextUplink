@@ -437,3 +437,43 @@ can affect the captured signal. Useful next solo tests are contrasting surprised
 angry, happy and neutral clips, preferably identical wording and similar playback
 level/distance. Include high-pitched non-angry delivery to check false anger.
 Log failures and uncertain cases as well as matches, and export the session log.
+
+## Cleanup and branch snapshot · November 6, 2026
+
+User requested saving the current working prototype to a new feature branch before
+removing earlier experiments. Saved and pushed **47f5ad9** on
+**codex/social-cues-stage1** BEFORE deletion. The cleanup follows as a separate
+commit on that branch, so the pre-cleanup code can be recovered from history.
+
+Current app scope: Microphone test, Live transcription, Emotion lab · Stage 1.
+Removed the old expressive-caption/upload workflow, pitch-shaped caption player,
+voice-isolation implementations/vendor code, alignment code and the old samples.
+Deleted local DeepFilterNet, MossFormer2, RE-USE and Qwen forced-aligner weights.
+Kept the SUPERB baseline because the emotion lab uses it for corroboration, and
+kept emotion2vec+ and local cached Qwen. Ignored model weights were NOT in the Git
+snapshot; the historical setup script gives their sources if required again.
+
+Historical sections above document earlier versions; commands mentioning removed
+models, samples or tabs do not describe the cleaned app. For current setup, use
+README.md and TECHNICAL.md. For old sample-based benchmark reproduction, recover
+the sample from the saved commit into a temporary file, e.g.:
+
+```sh
+git show 47f5ad9:samples/audio-without-noise.wav > /tmp/textuplink-old-clean-sample.wav
+```
+
+Only active live/emotion verification remains in the local ignored tests folder.
+Old tracked tests are removed along with the code they tested. The single `.venv`
+is preserved. No new stage, automatic wearer cue or camera feature was added.
+
+Cleanup verification:
+- 11 active live/emotion tests passed after removing tests for retired features.
+- AppTest confirmed exactly the three retained tabs, microphone WAV playback, and
+  successful inference/comparison using both actual local emotion models.
+- The simplified ASR-only Qwen loader transcribed the recovered two-second sample
+  as “A tanker is a ship designed.”
+- Removed enhancement-only packages `mlx`, `mlx-metal`, `noisereduce`; `uv pip check`
+  verified the 150 remaining installed packages are compatible.
+- The cleaned model folder contains emotion2vec+ and its SUPERB comparison model.
+  Qwen uses the existing local Hugging Face cache; its provisioning command is kept
+  so a new machine can store it in `models/qwen3-asr` instead.

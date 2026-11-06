@@ -7,8 +7,6 @@ torch>=2.4
 transformers>=4.57.6,<5
 huggingface-hub>=0.34,<1
 safetensors>=0.4
-noisereduce>=3
 qwen-asr==0.0.6
-mlx==0.32.4; sys_platform == "darwin" and platform_machine == "arm64"
 streamlit-webrtc==0.79.0
 funasr==1.4.22

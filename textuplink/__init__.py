@@ -1,1 +1,1 @@
-"""Local voice isolation and expressive captions."""
+"""Local glasses audio capture, transcription and vocal-emotion evaluation."""
